@@ -15,6 +15,7 @@ backend/test/
 backend/.env
 
 backend/prisma/migrations
+backend/scripts
 
 backend/nest-cli.json
 backend/eslint.config.mjs
