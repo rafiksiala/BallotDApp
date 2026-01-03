@@ -1,0 +1,40 @@
+# --------------------
+# Global
+# --------------------
+.env
+.env.*
+.DS_Store
+*.log
+
+# --------------------
+# Backend - generated / scaffolded
+# --------------------
+backend/node_modules/
+backend/dist/
+backend/test/
+backend/.env
+
+backend/prisma/migrations
+
+backend/nest-cli.json
+backend/eslint.config.mjs
+backend/.prettierrc
+backend/tsconfig.json
+backend/tsconfig.build.json
+backend/README.md
+
+# --------------------
+# Contracts (Hardhat)
+# --------------------
+contracts/node_modules/
+contracts/artifacts/
+contracts/cache/
+contracts/typechain/
+contracts/.env
+contracts/typechain-types
+contracts/README.md
+
+# --------------------
+# Local DB / runtime
+# --------------------
+db/data/
