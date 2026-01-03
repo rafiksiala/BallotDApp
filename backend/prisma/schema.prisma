@@ -1,0 +1,113 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
+// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model ContractSyncState {
+  id              Int      @id @default(autoincrement())
+  chainId          Int
+  contractAddress  String
+  lastProcessedBlock Int
+  updatedAt        DateTime @updatedAt
+
+  @@unique([chainId, contractAddress])
+}
+
+model OnChainEvent {
+  id             Int      @id @default(autoincrement())
+  chainId         Int
+  contractAddress String
+
+  blockNumber    Int
+  blockHash      String
+  txHash         String
+  logIndex       Int
+
+  eventName      String
+  argsJson       Json
+
+  createdAt      DateTime @default(now())
+
+  @@unique([chainId, txHash, logIndex])
+  @@index([chainId, contractAddress, blockNumber])
+  @@index([eventName])
+}
+
+model Proposal {
+  id              Int      @id @default(autoincrement())
+  chainId          Int
+  contractAddress  String
+
+  proposalId      Int
+  name            String
+  voteCount       String   @default("0") // store as string to avoid bigint issues
+
+  updatedAt       DateTime @updatedAt
+
+  @@unique([chainId, contractAddress, proposalId])
+  @@index([chainId, contractAddress])
+}
+
+model Voter {
+  id              Int      @id @default(autoincrement())
+  chainId          Int
+  contractAddress  String
+
+  voterAddress    String
+  weight          Int      @default(0)
+  hasVoted        Boolean  @default(false)
+
+  registeredAtBlock Int?
+  lastUpdatedBlock Int?
+
+  updatedAt       DateTime @updatedAt
+
+  @@unique([chainId, contractAddress, voterAddress])
+  @@index([chainId, contractAddress])
+}
+
+model Vote {
+  id              Int      @id @default(autoincrement())
+  chainId          Int
+  contractAddress  String
+
+  voterAddress    String
+  proposalId      Int
+  weight          Int
+
+  txHash          String
+  blockNumber     Int
+  createdAt       DateTime @default(now())
+
+  @@unique([chainId, contractAddress, voterAddress]) // one vote per voter
+  @@index([chainId, contractAddress, proposalId])
+  @@index([txHash])
+}
+
+model BallotSnapshot {
+  id              Int      @id @default(autoincrement())
+  chainId          Int
+  contractAddress  String
+
+  stage           Int      @default(0)
+  totalVoters     Int      @default(0)
+  totalVotes      Int      @default(0)
+
+  winnerComputed  Boolean  @default(false)
+  winningProposalId Int    @default(0)
+
+  lastIndexedBlock Int     @default(0)
+
+  updatedAt       DateTime @updatedAt
+
+  @@unique([chainId, contractAddress])
+}
