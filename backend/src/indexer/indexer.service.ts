@@ -1,9 +1,47 @@
 // src/indexer/indexer.service.ts
-// Notes:
-// - This service indexes on-chain events from the Ballot contract on Sepolia into PostgreSQL.
-// - It supports a "catch-up" mode that backfills logs in small block ranges to respect free-tier RPC limits.
-// - It stores raw events (audit-friendly) + a sync cursor (last processed block) so it can resume safely.
-// - It also projects events into a DB read model (snapshot/voters/votes/proposals) for fast /stats queries.
+//
+// Purpose
+// -------
+// - Index on-chain Ballot events from Sepolia into PostgreSQL (raw audit log).
+// - Maintain a sync cursor (last processed block) to resume safely.
+// - Project events into a read model (snapshot/voters/votes/proposals) for fast /stats queries.
+//
+// Why it can fail (and how we handle it)
+// -------------------------------------
+// Public RPC providers (e.g., Alchemy free tier) can rate-limit eth_getLogs requests.
+// This file adds:
+// - Retry with exponential backoff on HTTP 429 ("compute units per second exceeded").
+// - A small throttle (sleep) between batches.
+// - Non-fatal indexing (backend stays up even if indexing is temporarily rate-limited).
+//
+// Environment variables (backend/.env)
+// -----------------------------------
+// Required:
+// - SEPOLIA_RPC_URL=...
+// - BALLOT_ADDRESS=0x...
+// - CHAIN_ID=11155111                 (optional, default Sepolia)
+// - DEPLOYMENT_BLOCK=9971829          (recommended: exact deploy block for this contract)
+//
+// Optional knobs (safe defaults exist):
+// - MAX_LOG_BLOCK_RANGE=10            (Alchemy free tier often needs small ranges)
+// - CONFIRMATIONS=2                   (avoid indexing very tip blocks)
+// - RPC_THROTTLE_MS=400               (sleep between batches to reduce rate limits)
+// - RPC_MAX_RETRIES=8                 (retry attempts on 429)
+// - RPC_BACKOFF_BASE_MS=1500          (base for exponential backoff)
+// - RPC_BACKOFF_CAP_MS=30000          (max wait between retries)
+// - POLL_INTERVAL_MS=15000            (poll cadence after initial catch-up)
+//
+// Important note about changing contracts
+// --------------------------------------
+// If you redeploy and update BALLOT_ADDRESS/DEPLOYMENT_BLOCK, you should also delete the
+// ContractSyncState row for the previous contract address, otherwise the indexer will
+// continue from the old cursor.
+//
+// Example SQL (Postgres):
+// DELETE FROM "ContractSyncState"
+// WHERE "chainId" = 11155111
+//   AND "contractAddress" = '<old-lowercased-address>';
+//
 
 import { Injectable, OnModuleInit } from "@nestjs/common";
 import { PrismaService } from "../prisma/prisma.service";
@@ -23,35 +61,49 @@ export class IndexerService implements OnModuleInit {
   private readonly chainId = Number(process.env.CHAIN_ID || "11155111"); // Sepolia by default
   private contractAddress!: string;
 
-  // RPC limitations & safety knobs
-  private readonly MAX_LOG_BLOCK_RANGE = 10;
+  // Safety knobs (override via env if needed)
+  private readonly MAX_LOG_BLOCK_RANGE = Number(process.env.MAX_LOG_BLOCK_RANGE || "10");
+  private readonly CONFIRMATIONS = Number(process.env.CONFIRMATIONS || "2");
 
-  // Optional confirmations to reduce the chance of indexing blocks that might be reorged
-  private readonly CONFIRMATIONS = 2;
+  // Rate-limit handling knobs
+  private readonly RPC_THROTTLE_MS = Number(process.env.RPC_THROTTLE_MS || "400");
+  private readonly RPC_MAX_RETRIES = Number(process.env.RPC_MAX_RETRIES || "8");
+  private readonly RPC_BACKOFF_BASE_MS = Number(process.env.RPC_BACKOFF_BASE_MS || "1500");
+  private readonly RPC_BACKOFF_CAP_MS = Number(process.env.RPC_BACKOFF_CAP_MS || "30000");
 
-  constructor(private readonly prisma: PrismaService) { }
+  // Polling cadence
+  private readonly POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || "15000");
+
+  constructor(private readonly prisma: PrismaService) {}
 
   async onModuleInit() {
     await this.initProviderAndContract();
 
     // Quick sanity check: prove we can read on-chain state
-    const stage = await this.contract.currentStage();
+    const stage = await this.withRetry(
+      () => this.contract.currentStage(),
+      "read currentStage"
+    );
     console.log("🗳️ Ballot currentStage (on-chain):", stage.toString());
 
-    // Backfill events from the last cursor to the latest safe block
-    await this.catchUpOnce();
+    // First catch-up (do not crash the whole API if RPC is rate-limited)
+    try {
+      await this.catchUpOnce();
+    } catch (e: any) {
+      console.error(
+        "⚠️ Initial catch-up failed (backend will stay up; polling will retry):",
+        e?.shortMessage || e
+      );
+    }
 
-    // Poll every 15 seconds
+    // Poll periodically (safe: each iteration handles its own errors)
     setInterval(async () => {
       try {
         await this.catchUpOnce();
-      } catch (e) {
-        console.error("Indexer polling failed:", e);
+      } catch (e: any) {
+        console.error("⚠️ Indexer polling failed:", e?.shortMessage || e);
       }
-    }, 15_000);
-
-    // (Optional) Enable live indexing after catch-up (not enabled by default here).
-    // await this.startLiveListener();
+    }, this.POLL_INTERVAL_MS);
   }
 
   // ----------------------------
@@ -79,6 +131,9 @@ export class IndexerService implements OnModuleInit {
     console.log("🔗 Indexer connected:", {
       chainId: this.chainId,
       contract: this.contractAddress,
+      batch: this.MAX_LOG_BLOCK_RANGE,
+      confirmations: this.CONFIRMATIONS,
+      throttleMs: this.RPC_THROTTLE_MS,
     });
   }
 
@@ -105,9 +160,7 @@ export class IndexerService implements OnModuleInit {
       "Ballot.address.json"
     );
 
-    const parsed = JSON.parse(
-      fs.readFileSync(addressPath, "utf-8")
-    ) as AddressJson;
+    const parsed = JSON.parse(fs.readFileSync(addressPath, "utf-8")) as AddressJson;
 
     if (!parsed.address) {
       throw new Error("Ballot.address.json is missing the 'address' field");
@@ -117,20 +170,61 @@ export class IndexerService implements OnModuleInit {
   }
 
   // ----------------------------
+  // Rate-limit helpers
+  // ----------------------------
+
+  private sleep(ms: number) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  private isRateLimitError(e: any): boolean {
+    const code = e?.error?.code || e?.code;
+    const msg = e?.error?.message || e?.message || "";
+    return code === 429 || msg.includes("compute units per second");
+  }
+
+  private async withRetry<T>(fn: () => Promise<T>, label: string): Promise<T> {
+    let attempt = 0;
+
+    while (true) {
+      try {
+        return await fn();
+      } catch (e: any) {
+        if (!this.isRateLimitError(e) || attempt >= this.RPC_MAX_RETRIES) {
+          throw e;
+        }
+
+        const waitMs = Math.min(
+          this.RPC_BACKOFF_BASE_MS * Math.pow(2, attempt),
+          this.RPC_BACKOFF_CAP_MS
+        );
+
+        console.warn(
+          `⏳ Rate-limited (429) during ${label}. Retry ${attempt + 1}/${this.RPC_MAX_RETRIES} in ${waitMs}ms`
+        );
+
+        await this.sleep(waitMs);
+        attempt += 1;
+      }
+    }
+  }
+
+  // ----------------------------
   // Sync state (cursor)
   // ----------------------------
 
   private async getOrCreateSyncState() {
     // Start strategy:
-    // - If a deployment block is provided, start from there (best practice).
+    // - If DEPLOYMENT_BLOCK is provided, start from there (best practice).
     // - Otherwise, start near the chain tip to keep the first run fast.
-    const latest = await this.provider.getBlockNumber();
+    const latest = await this.withRetry(
+      () => this.provider.getBlockNumber(),
+      "getBlockNumber"
+    );
     const deploymentBlock = Number(process.env.DEPLOYMENT_BLOCK || "0");
 
     const defaultStart =
-      deploymentBlock > 0
-        ? Math.max(deploymentBlock - 1, 0)
-        : Math.max(latest - 100, 0);
+      deploymentBlock > 0 ? Math.max(deploymentBlock - 1, 0) : Math.max(latest - 100, 0);
 
     const state = await this.prisma.contractSyncState.upsert({
       where: {
@@ -157,13 +251,16 @@ export class IndexerService implements OnModuleInit {
   private async catchUpOnce() {
     const state = await this.getOrCreateSyncState();
 
-    const latest = await this.provider.getBlockNumber();
+    const latest = await this.withRetry(
+      () => this.provider.getBlockNumber(),
+      "getBlockNumber"
+    );
     const safeLatest = Math.max(latest - this.CONFIRMATIONS, 0);
 
     const fromBlockInitial = state.lastProcessedBlock + 1;
 
     if (fromBlockInitial > safeLatest) {
-      console.log("✅ No new blocks to index.", { latest, safeLatest });
+      // Keep logs quiet during polling when there is nothing to do
       return;
     }
 
@@ -175,21 +272,13 @@ export class IndexerService implements OnModuleInit {
     let fromBlock = fromBlockInitial;
 
     while (fromBlock <= safeLatest) {
-      const toBlock = Math.min(
-        fromBlock + this.MAX_LOG_BLOCK_RANGE - 1,
-        safeLatest
-      );
+      const toBlock = Math.min(fromBlock + this.MAX_LOG_BLOCK_RANGE - 1, safeLatest);
 
-      let logs: Array<ethers.Log | ethers.EventLog> = [];
-      try {
-        logs = await this.contract.queryFilter("*", fromBlock, toBlock);
-      } catch (e: any) {
-        console.error(
-          `❌ getLogs failed for range ${fromBlock} -> ${toBlock}`,
-          e?.shortMessage || e
-        );
-        throw e;
-      }
+      // Important: eth_getLogs is the most rate-limited RPC call in free tiers.
+      const logs = await this.withRetry(
+        () => this.contract.queryFilter("*", fromBlock, toBlock),
+        `eth_getLogs ${fromBlock}->${toBlock}`
+      );
 
       if (logs.length > 0) {
         console.log(`🧾 Range ${fromBlock} -> ${toBlock}: ${logs.length} logs`);
@@ -238,7 +327,7 @@ export class IndexerService implements OnModuleInit {
 
       insertedTotal += inserted;
 
-      // Update cursor progressively (important for crash-safety mid-backfill)
+      // Update cursor progressively (crash-safe: if process stops mid-way, we resume here)
       await this.prisma.contractSyncState.update({
         where: {
           chainId_contractAddress: {
@@ -249,10 +338,17 @@ export class IndexerService implements OnModuleInit {
         data: { lastProcessedBlock: toBlock },
       });
 
+      // Throttle between batches to reduce RPC rate limiting
+      if (this.RPC_THROTTLE_MS > 0) {
+        await this.sleep(this.RPC_THROTTLE_MS);
+      }
+
       fromBlock = toBlock + 1;
     }
 
-    console.log(`✅ Catch-up done. Inserted ${insertedTotal} new events.`);
+    if (insertedTotal > 0) {
+      console.log(`✅ Catch-up done. Inserted ${insertedTotal} new events.`);
+    }
   }
 
   // ----------------------------
@@ -418,8 +514,9 @@ export class IndexerService implements OnModuleInit {
           },
         });
 
-        // Increment totalVoters only when a voter is newly created is more correct,
-        // but for simplicity we increment on each new VoterRegistered event.
+        // For strict correctness, increment only when the row is created.
+        // Here we keep it simple: we only call projection when the raw event is new,
+        // so this increment won't double-count unless the event itself is duplicated.
         await this.prisma.ballotSnapshot.update({
           where: { chainId_contractAddress: { chainId, contractAddress } },
           data: { totalVoters: { increment: 1 } },
@@ -488,7 +585,7 @@ export class IndexerService implements OnModuleInit {
           },
         });
 
-        // Update proposal cached voteCount (string arithmetic)
+        // Update proposal cached voteCount (stored as string in DB)
         const existing = await this.prisma.proposal.findUnique({
           where: {
             chainId_contractAddress_proposalId: {
@@ -549,8 +646,11 @@ export class IndexerService implements OnModuleInit {
   }
 
   // ----------------------------
-  // (Optional) Live listener (not enabled yet)
+  // Optional live listener (advanced topic)
   // ----------------------------
+  // A contract.on("*") listener can stream events in "real time".
+  // For strict correctness, you also need reorg handling. Polling + cursor is simpler and robust.
+  //
   // private async startLiveListener() {
   //   console.log("📡 Live listener started (contract.on)");
   //
