@@ -17,12 +17,20 @@ backend/.env
 backend/prisma/migrations
 backend/scripts
 
-backend/nest-cli.json
-backend/eslint.config.mjs
-backend/.prettierrc
-backend/tsconfig.json
-backend/tsconfig.build.json
 backend/README.md
+
+# --------------------
+# Frontend - 
+# --------------------
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+
+frontend/.env
+frontend/.env.local
+frontend/.env.*.local
+
+frontend/README.md
 
 # --------------------
 # Contracts (Hardhat)
@@ -39,3 +47,4 @@ contracts/README.md
 # Local DB / runtime
 # --------------------
 db/data/
+
