@@ -2,31 +2,116 @@
 
 ## Overview
 
-This project implements a complete Web3 voting application built on Ethereum, combining **on-chain smart contract logic** with a **traditional backend and database** to deliver a robust, scalable, and performant system.
+This repository contains a complete Web3 voting application built on Ethereum testnet (**Sepolia**) that combines:
 
-The blockchain remains the **source of truth** for voting rules and state, while an off-chain backend indexes events into a relational database to provide fast reads, analytics, and a clean API surface.
+- **On-chain logic (Solidity smart contract)** as the source of truth  
+- **Off-chain indexing (NestJS + ethers.js)** to persist and query events efficiently  
+- **Relational read model (PostgreSQL 15 + Prisma v7)** for fast reads, analytics, and projections  
+- **REST API layer (NestJS)** for frontend-friendly access  
+- **Frontend (Next.js + MetaMask)** for user interaction (wallet connection, voting, admin actions)
 
-The architecture follows a clear separation of concerns:
-
-* **Smart contract** → correctness, transparency, immutability
-* **Backend indexer** → synchronization and persistence
-* **Database** → fast queries and aggregation
-* **API layer** → frontend-friendly access
+The system is designed with production-minded patterns: restart-safe indexing, idempotent event ingestion, batching to respect RPC limits, and clear separation between read-only contract queries and write transactions.
 
 ---
 
-## Architecture Summary
+## Architecture
+
+### End-to-End Data Flow
 
 ```
-Smart Contract (Sepolia)
-        ↓ emits events
-Indexer Service (NestJS)
-        ↓
-PostgreSQL (Read Model)
-        ↓
-REST APIs (NestJS)
-        ↓
-Frontend (Next.js + MetaMask) [coming next]
+
+```
+        ┌─────────────────────────────────┐
+        │   Frontend (Next.js + wagmi)    │
+        │   - MetaMask wallet             │
+        │   - Vote / Register / Finalize  │
+        └───────────────┬─────────────────┘
+                        │
+       (read/write)     │      (REST)
+                        │
+        ┌───────────────▼─────────────────┐
+        │          Backend (NestJS)       │
+        │                                 │
+        │  BallotModule (reads)           │
+        │   - Reads state from chain      │
+        │   - Proposals / winner          │
+        │                                 │
+        │  BallotWriter (writes)          │
+        │   - Sends tx for chairperson    │
+        │   - Register / Finalize / etc   │
+        │                                 │
+        │  IndexerModule (sync)           │
+        │   - Fetch logs in batches       │
+        │   - Persist raw events          │
+        │   - Maintain sync cursor        │
+        │   - Optional polling/live       │
+        │                                 │
+        │  StatsModule (analytics)        │
+        │   - Reads DB projections        │
+        │   - Returns aggregated stats    │
+        └───────────────┬─────────────────┘
+                        │
+                        │ (SQL via Prisma v7)
+                        │
+        ┌───────────────▼─────────────────┐
+        │   PostgreSQL 15 (Read Model)    │
+        │   - Raw event log               │
+        │   - Sync cursor                 │
+        │   - Snapshots / proposals       │
+        └─────────────────────────────────┘
+
+        ┌─────────────────────────────────┐
+        │   Smart Contract (Sepolia)      │
+        │   - Stages, windows, voting     │
+        │   - Emits index-friendly events │
+        └─────────────────────────────────┘
+```
+
+```
+
+### Responsibilities (Separation of Concerns)
+
+- **Smart contract**: correctness, transparency, deterministic rules  
+- **Backend “Read” layer**: authoritative reads directly from chain  
+- **Backend “Write” layer (BallotWriter)**: controlled transaction sending  
+- **Indexer**: sync events from chain into DB (audit trail + cursor)  
+- **Stats**: fast analytics from DB projections  
+- **Frontend**: user-facing UX (wallet connect + actions)
+
+---
+
+## Repository Structure (Monorepo)
+
+```
+
+ballot-dapp/
+│
+├── contracts/                    # Solidity + Hardhat scripts
+│   ├── contracts/                # Ballot.sol
+│   ├── scripts/                  # deploy/register/vote/finalize etc.
+│   ├── test/                     # Hardhat tests
+│   └── hardhat.config.ts
+│
+├── backend/                      # NestJS backend
+│   ├── prisma/                   # Prisma schema & migrations
+│   ├── src/
+│   │   ├── ballot/               # Read from chain (BallotService) + REST + Write transactions (register/finalize)
+│   │   ├── indexer/              # Event indexing from chain → DB
+│   │   ├── stats/                # DB analytics endpoints
+│   │   ├── prisma/               # Prisma module/service (v7 adapter-pg)
+│   │   └── main.ts               # Nest bootstrap
+│   └── .env                      # Backend env (not committed)
+│
+├── shared/
+│   └── contract-metadata/
+│       ├── Ballot.abi.json
+│       └── Ballot.address.json
+│
+└── frontend/                     # Next.js frontend
+├── src/app/                  # App Router
+├── src/lib/                  # API + wagmi config
+└── .env.local                # Frontend env (not committed)
+
 ```
 
 ---
@@ -38,159 +123,233 @@ Frontend (Next.js + MetaMask) [coming next]
 The `Ballot` smart contract manages the full voting lifecycle on-chain.
 
 **Key features:**
+- Explicit lifecycle stages: `Init → Reg → Vote → Done`
+- Time-window driven stage progression (deterministic)
+- Chairperson-controlled voter registration (weighted)
+- Proposal-based voting
+- Winner computation via `finalize()`
+- Index-friendly events emitted for off-chain indexing
 
-* Explicit voting stages (`Init → Reg → Vote → Done`)
-* Time-based stage progression with optional manual override
-* Voter registration with weights
-* Proposal-based voting
-* Deterministic winner computation
-* Strongly typed, index-friendly events
-
-**On-chain source of truth:**
-
-* Stage
-* Time windows
-* Vote counts
-* Winner
-
-All state transitions emit events to enable off-chain indexing.
+**Source of truth on-chain:**
+- Stage
+- Time windows
+- Vote counts per proposal
+- Winner state
 
 ---
 
-## Backend
+## Backend (NestJS)
 
-The backend is implemented with **NestJS** and exposes REST APIs for both on-chain reads and off-chain analytics.
+The backend exposes a clean REST API and runs the indexing process that syncs blockchain events into PostgreSQL.
 
-### Modules Overview
+### Ballot Module (On-chain Reads)
 
-#### Ballot Module (On-chain Reads)
-
-* Reads data directly from the smart contract via `ethers.js`
-* Provides authoritative views of:
-
-  * Current stage and timings
-  * Proposals and vote counts
-  * Winner (when finalized)
+**Goal:** Provide authoritative reads from the smart contract (source of truth).
 
 Endpoints:
-
 ```
+
 GET /ballot/state
 GET /ballot/proposals
 GET /ballot/winner
+
 ```
+
+What it returns:
+- current stage and timestamps
+- proposal list and vote counts
+- winner details (if finalized)
 
 ---
 
-#### Indexer Module (Blockchain → Database)
+### Ballot Writer (On-chain Writes)
 
-* Connects to Sepolia via JSON-RPC
-* Fetches logs in small block ranges (RPC-safe)
-* Persists:
+**Goal:** Send transactions to the contract using a signer (chairperson/deployer key).
 
-  * Raw events (audit trail)
-  * Synchronization cursor (last indexed block)
-* Supports restart-safe catch-up indexing
-* Optional polling to keep the database in sync without restarting
+Typical use-cases:
+- register voters (chairperson only)
+- finalize the ballot (access control depends on contract rules)
+- optional manual stage management (if contract supports it)
+
+> This layer exists to keep write operations isolated from read-only services.
+
+---
+
+### Indexer Module (Blockchain → Database)
+
+**Goal:** Sync on-chain events into PostgreSQL with production-minded patterns:
+
+- Fetch logs in small block ranges (RPC-safe batching)
+- Persist an immutable audit trail (`OnChainEvent`)
+- Maintain an indexing cursor (`ContractSyncState`)
+- Restart-safe: can resume from last processed block
+- Optional polling/live mode to keep DB updated continuously
 
 Debug endpoints:
-
 ```
-GET /events
+
+GET /events?limit=50
 GET /sync
+
 ```
 
 ---
 
-#### Stats Module (Off-chain Analytics)
+### Stats Module (Off-chain Analytics)
 
-* Reads from PostgreSQL only
-* Computes aggregated metrics:
-
-  * Total voters
-  * Total votes
-  * Participation rate
-  * Proposal results
-  * Winner status
-* Optimized for frontend consumption
+**Goal:** Provide frontend-friendly aggregated stats from PostgreSQL projections.
 
 Endpoint:
+```
+
+GET /stats
 
 ```
-GET /stats
-```
+
+Metrics:
+- total voters
+- total votes
+- participation rate
+- proposals results
+- winner status
+- last indexed block
 
 ---
 
-## Database
+## Database (PostgreSQL 15 + Prisma v7)
 
-The database uses **PostgreSQL 15** with **Prisma v7**.
+The DB is a **read model** optimized for analytics and UI reads.
 
-### Data Model Highlights
+### Core Tables / Models
 
-* `OnChainEvent`
+- `OnChainEvent`
+  - immutable audit log of indexed events
+  - unique constraint on `(chainId, txHash, logIndex)` to prevent duplicates
 
-  * Immutable audit log of blockchain events
-* `ContractSyncState`
+- `ContractSyncState`
+  - persistent cursor storing the last indexed block per `(chainId, contractAddress)`
 
-  * Persistent indexing cursor
-* `ballotSnapshot`
-
-  * Aggregated contract state
-* `proposal`
-
-  * Cached proposal results
+- Projections (if enabled in your schema)
+  - `ballotSnapshot` (cached contract state)
+  - `proposal` (cached proposal counts)
+  - plus any derived tables you add (voters/votes, etc.)
 
 This design enables:
-
-* Fast queries
-* Deterministic rebuilds
-* Clear separation between raw data and projections
-
----
-
-## Project Structure (Monorepo)
-
-```
-ballot-dapp/
-│
-├── contracts/          # Solidity contracts & Hardhat scripts
-│
-├── backend/            # NestJS backend
-│   ├── src/
-│   │   ├── ballot/     # On-chain reads
-│   │   ├── indexer/    # Event indexing
-│   │   ├── stats/      # Analytics
-│   │   ├── prisma/    # Database access
-│
-├── shared/
-│   └── contract-metadata/
-│       ├── Ballot.abi.json
-│       └── Ballot.address.json
-│
-└── frontend/           # Next.js frontend (coming next)
-```
+- fast queries
+- deterministic rebuilds
+- clean separation between raw data and projections
 
 ---
 
 ## Environment Variables
 
-### Backend
+### Contracts (`contracts/.env`)
 
 ```
+
+SEPOLIA_RPC_URL=
+DEPLOYER_PRIVATE_KEY=
+BALLOT_ADDRESS=   # optional, used by scripts
+
+```
+
+### Backend (`backend/.env`)
+
+```
+
 SEPOLIA_RPC_URL=
 DATABASE_URL=
 BALLOT_ADDRESS=
 CHAIN_ID=11155111
 DEPLOYMENT_BLOCK=
-```
-
-### Smart Contracts
 
 ```
-SEPOLIA_RPC_URL=
-DEPLOYER_PRIVATE_KEY=
+
+### Frontend (`frontend/.env.local`)
+
+Example:
 ```
+
+NEXT_PUBLIC_BACKEND_URL=[http://localhost:3000](http://localhost:3000)
+NEXT_PUBLIC_CHAIN_ID=11155111
+
+````
+
+> Never commit any `.env*` files.
+
+---
+
+## How to Run (Local Development)
+
+### 1) Smart Contracts
+
+From `contracts/`:
+
+```bash
+npm install
+npx hardhat compile
+````
+
+Deploy to Sepolia:
+
+```bash
+npx hardhat run scripts/deploy-sepolia.ts --network sepolia
+```
+
+After deploy, update:
+
+* `shared/contract-metadata/Ballot.address.json`
+* `backend/.env` `BALLOT_ADDRESS` and `DEPLOYMENT_BLOCK`
+* `contracts/.env` `BALLOT_ADDRESS` (optional)
+
+---
+
+### 2) Database (PostgreSQL 15)
+
+Create a Postgres database and set `DATABASE_URL` in `backend/.env`.
+
+Example URL:
+
+```
+DATABASE_URL="postgresql://user:password@localhost:5432/ballot?schema=public"
+```
+
+Run Prisma migrations:
+
+```bash
+cd backend
+npx prisma migrate dev
+```
+
+---
+
+### 3) Backend (NestJS)
+
+```bash
+cd backend
+npm install
+npm run start:dev
+```
+
+Useful endpoints:
+
+* `http://localhost:3000/events?limit=10`
+* `http://localhost:3000/ballot/state`
+* `http://localhost:3000/stats`
+
+---
+
+### 4) Frontend (Next.js)
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+Open:
+
+* `http://localhost:3001`
 
 ---
 
@@ -198,30 +357,29 @@ DEPLOYER_PRIVATE_KEY=
 
 * **Blockchain as source of truth**
 * **Off-chain indexing for performance**
-* **Idempotent and restart-safe indexing**
-* **Clear separation of responsibilities**
-* **Production-minded tradeoffs (RPC limits, polling, batching)**
+* **Restart-safe indexing via cursor**
+* **Idempotent ingestion via unique constraints**
+* **Read vs Write separation (BallotService vs BallotWriter)**
+* **RPC-safe batching & retry/polling tradeoffs**
 
 ---
 
 ## Roadmap
 
-* [x] Smart contract with full voting lifecycle
-* [x] Backend indexing & analytics
-* [x] REST API layer
-* [ ] Frontend (Next.js + MetaMask)
-* [ ] UI-driven voting and results visualization
-* [ ] Access control and UX improvements
+* [x] Smart contract lifecycle + index-friendly events
+* [x] Hardhat scripts for deploy and interactions
+* [x] Backend read APIs (on-chain)
+* [x] Backend indexing into PostgreSQL (cursor + batching)
+* [x] Backend stats APIs (off-chain)
+* [x] Frontend setup (Next.js + wagmi)
+* [ ] UI polishing (layout, error UX, admin flows)
+* [ ] Optional: live listener + advanced reorg handling
+* [ ] Optional: deterministic rebuild from deployment block
 
 ---
 
-## Summary
+## Notes
 
-This project demonstrates how to build a **complete Web3 application** by combining:
-
-* deterministic on-chain logic
-* reliable off-chain infrastructure
-* traditional backend patterns
-* modern API design
-
-The result is a system that is transparent, scalable, and performant while remaining easy to reason about and extend.
+* This project uses **Sepolia only** (no mainnet).
+* Test ETH can be acquired using public faucets.
+* RPC providers may throttle `eth_getLogs`; indexing uses batching and should be configured with a correct `DEPLOYMENT_BLOCK`.

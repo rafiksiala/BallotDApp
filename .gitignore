@@ -17,8 +17,6 @@ backend/.env
 backend/prisma/migrations
 backend/scripts
 
-backend/README.md
-
 # --------------------
 # Frontend - 
 # --------------------
@@ -30,8 +28,6 @@ frontend/.env
 frontend/.env.local
 frontend/.env.*.local
 
-frontend/README.md
-
 # --------------------
 # Contracts (Hardhat)
 # --------------------
@@ -41,7 +37,6 @@ contracts/cache/
 contracts/typechain/
 contracts/.env
 contracts/typechain-types
-contracts/README.md
 
 # --------------------
 # Local DB / runtime
