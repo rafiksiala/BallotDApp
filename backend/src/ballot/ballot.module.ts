@@ -7,6 +7,9 @@ import { BallotService } from "./ballot.service";
 // Controller exposing REST endpoints under /ballot
 import { BallotController } from "./ballot.controller";
 
+// Server-side writer for chairperson actions
+import { BallotWriter } from "./ballot.writer";
+
 /**
  * BallotModule groups everything related to reading
  * the Ballot smart contract state.
@@ -25,12 +28,12 @@ import { BallotController } from "./ballot.controller";
  */
 @Module({
   // Providers contain business logic and external integrations
-  providers: [BallotService],
+  providers: [BallotService, BallotWriter],
 
   // Controllers define the HTTP API surface
   controllers: [BallotController],
 
-  // Export BallotService so other modules can inject it
-  exports: [BallotService],
+  // Export BallotService and BallotWriter so other modules can inject it
+  exports: [BallotService, BallotWriter],
 })
 export class BallotModule {}

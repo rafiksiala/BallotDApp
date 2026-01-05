@@ -1,22 +1,37 @@
+// src/ballot/ballot.controller.ts
 // NestJS decorators to define HTTP controllers and routes
-import { Controller, Get } from "@nestjs/common";
+import { Body, Controller, Get, Post } from "@nestjs/common";
 
-// BallotService is responsible for reading data from the smart contract
+// BallotService is responsible for read-only access to on-chain contract state
 import { BallotService } from "./ballot.service";
+
+// BallotWriter is responsible for chairperson-only on-chain actions (server-signed)
+import { BallotWriter } from "./ballot.writer";
 
 /**
  * BallotController exposes REST endpoints under the `/ballot` prefix.
  *
- * Its role is very thin:
- * - it does not contain business logic
- * - it simply delegates read operations to BallotService
+ * Design goals:
+ * - Keep controllers thin (no business logic).
+ * - Delegate on-chain reads to BallotService (source of truth).
+ * - Delegate chairperson actions to BallotWriter (server-signed transactions).
  *
- * This separation keeps the controller simple and testable.
+ * This separation keeps code:
+ * - easier to test
+ * - easier to reason about
+ * - aligned with common backend architecture patterns
  */
 @Controller("ballot")
 export class BallotController {
-  // BallotService is injected via NestJS dependency injection
-  constructor(private readonly ballot: BallotService) {}
+  // Services are injected via NestJS dependency injection
+  constructor(
+    private readonly ballot: BallotService,
+    private readonly writer: BallotWriter
+  ) {}
+
+  // ----------------------------
+  // Read endpoints (source of truth: blockchain)
+  // ----------------------------
 
   /**
    * GET /ballot/state
@@ -27,8 +42,7 @@ export class BallotController {
    * - total voters and votes
    * - winner status
    *
-   * This endpoint reads directly from the smart contract
-   * and represents the source of truth.
+   * This endpoint reads directly from the smart contract.
    */
   @Get("state")
   async state() {
@@ -55,5 +69,58 @@ export class BallotController {
   @Get("winner")
   async winner() {
     return this.ballot.getWinner();
+  }
+
+  // ----------------------------
+  // Chairperson identity
+  // ----------------------------
+
+  /**
+   * GET /ballot/chairperson
+   *
+   * Returns the address of the backend signer used for chairperson actions.
+   *
+   * The frontend uses this to decide whether to show/enable admin actions.
+   * Note: This returns the signer address, not the private key.
+   */
+  @Get("chairperson")
+  async chairperson() {
+    const chairperson = await this.writer.getChairpersonAddress();
+    return { chairperson };
+  }
+
+  // ----------------------------
+  // Chairperson actions (server-signed)
+  // ----------------------------
+
+  /**
+   * POST /ballot/register
+   *
+   * Registers a voter on-chain (chairperson-only).
+   *
+   * Payload:
+   * {
+   *   "voterAddress": "0x..."
+   * }
+   *
+   * The transaction is signed by the backend signer (BallotWriter),
+   * so the connected wallet in the UI does NOT sign this operation.
+   */
+  @Post("register")
+  async register(@Body() body: { voterAddress: string }) {
+    return this.writer.registerVoter(body.voterAddress);
+  }
+
+  /**
+   * POST /ballot/finalize
+   *
+   * Finalizes the ballot on-chain (chairperson-only).
+   *
+   * The transaction is signed by the backend signer (BallotWriter).
+   * The frontend just triggers it.
+   */
+  @Post("finalize")
+  async finalize() {
+    return this.writer.finalize();
   }
 }
